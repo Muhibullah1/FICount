@@ -19,6 +19,63 @@ IM_NORM_MEAN = [0.485, 0.456, 0.406]
 IM_NORM_STD = [0.229, 0.224, 0.225]
 
 
+def extract_features(feature_model, image, boxes, feat_map_keys=['map3','map4'], exemplar_scales=[0.9,1.1], siamese_models=None):
+    """
+    Extract image features and compute similarity maps using Siamese models.
+    Returns aggregated features of shape [B, 6, Hf, Wf] suitable for the CountRegressor."""
+    
+    if siamese_models is None:
+        raise RuntimeError("You must pass siamese_models={'map3':..., 'map4':...} to extract_features")
+
+    device = image.device
+    N, M = image.shape[0], boxes.shape[2]
+    Image_features = feature_model(image)
+
+    Combined = None
+
+    for ix in range(N):
+        boxes_i = boxes[ix][0]
+        for keys in feat_map_keys:
+            image_features = Image_features[keys][ix].unsqueeze(0)
+            Scaling = 8.0 if keys == 'map3' else 16.0
+            boxes_scaled = boxes_i / Scaling
+            boxes_scaled[:, 1:3] = torch.floor(boxes_scaled[:, 1:3])
+            boxes_scaled[:, 3:5] = torch.ceil(boxes_scaled[:, 3:5])
+            boxes_scaled[:, 3:5] += 1
+            feat_h, feat_w = image_features.shape[-2], image_features.shape[-1]
+            boxes_scaled[:, 1:3] = torch.clamp_min(boxes_scaled[:, 1:3], 0)
+            boxes_scaled[:, 3] = torch.clamp_max(boxes_scaled[:, 3], feat_h)
+            boxes_scaled[:, 4] = torch.clamp_max(boxes_scaled[:, 4], feat_w)
+
+            # Extract exemplar patches
+            exemplar_feats = []
+            for j in range(M):
+                y1, x1 = int(boxes_scaled[j,1]), int(boxes_scaled[j,2])
+                y2, x2 = int(boxes_scaled[j,3]), int(boxes_scaled[j,4])
+                ex = image_features[:,:,y1:y2,x1:x2]
+                exemplar_feats.append(F.interpolate(ex, size=(32,32), mode='bilinear', align_corners=False))
+
+            exemplar_feats = torch.cat(exemplar_feats, dim=0).to(device)  # [E, C, 32, 32]
+
+            # Siamese similarity map
+            siamese_model = siamese_models[keys]
+            sim_maps = siamese_model(image_features, exemplar_feats)   # [1, E, Hf, Wf]
+
+            # Aggregate across exemplars -> 3 channels per map
+            mean_sim = torch.mean(sim_maps, dim=1, keepdim=True)
+            max_sim, _ = torch.max(sim_maps, dim=1, keepdim=True)
+            std_sim = torch.std(sim_maps, dim=1, unbiased=False, keepdim=True)
+            agg = torch.cat([mean_sim, max_sim, std_sim], dim=1)  # [1,3,Hf,Wf]
+
+            if Combined is None:
+                Combined = agg
+            else:
+                # match spatial sizes before concat
+                if Combined.shape[2] != agg.shape[2] or Combined.shape[3] != agg.shape[3]:
+                    agg = F.interpolate(agg, size=(Combined.shape[2], Combined.shape[3]), mode='bilinear', align_corners=False)
+                Combined = torch.cat((Combined, agg), dim=1)  # [1,6,Hf,Wf] after both maps
+
+    return Combined
 def select_exemplar_rois(image):
     all_rois = []
 
@@ -125,64 +182,6 @@ def pad_to_size(feat, desire_h, desire_w):
 
     return F.pad(feat, (left_pad, right_pad, top_pad, bottom_pad))
 
-
-def extract_features(feature_model, image, boxes, feat_map_keys=['map3','map4'], exemplar_scales=[0.9,1.1], siamese_models=None):
-    """
-    Extract image features and compute similarity maps using Siamese models.
-    Returns aggregated features of shape [B, 6, Hf, Wf] suitable for the CountRegressor."""
-    
-    if siamese_models is None:
-        raise RuntimeError("You must pass siamese_models={'map3':..., 'map4':...} to extract_features")
-
-    device = image.device
-    N, M = image.shape[0], boxes.shape[2]
-    Image_features = feature_model(image)
-
-    Combined = None
-
-    for ix in range(N):
-        boxes_i = boxes[ix][0]
-        for keys in feat_map_keys:
-            image_features = Image_features[keys][ix].unsqueeze(0)
-            Scaling = 8.0 if keys == 'map3' else 16.0
-            boxes_scaled = boxes_i / Scaling
-            boxes_scaled[:, 1:3] = torch.floor(boxes_scaled[:, 1:3])
-            boxes_scaled[:, 3:5] = torch.ceil(boxes_scaled[:, 3:5])
-            boxes_scaled[:, 3:5] += 1
-            feat_h, feat_w = image_features.shape[-2], image_features.shape[-1]
-            boxes_scaled[:, 1:3] = torch.clamp_min(boxes_scaled[:, 1:3], 0)
-            boxes_scaled[:, 3] = torch.clamp_max(boxes_scaled[:, 3], feat_h)
-            boxes_scaled[:, 4] = torch.clamp_max(boxes_scaled[:, 4], feat_w)
-
-            # Extract exemplar patches
-            exemplar_feats = []
-            for j in range(M):
-                y1, x1 = int(boxes_scaled[j,1]), int(boxes_scaled[j,2])
-                y2, x2 = int(boxes_scaled[j,3]), int(boxes_scaled[j,4])
-                ex = image_features[:,:,y1:y2,x1:x2]
-                exemplar_feats.append(F.interpolate(ex, size=(32,32), mode='bilinear', align_corners=False))
-
-            exemplar_feats = torch.cat(exemplar_feats, dim=0).to(device)  # [E, C, 32, 32]
-
-            # Siamese similarity map
-            siamese_model = siamese_models[keys]
-            sim_maps = siamese_model(image_features, exemplar_feats)   # [1, E, Hf, Wf]
-
-            # Aggregate across exemplars -> 3 channels per map
-            mean_sim = torch.mean(sim_maps, dim=1, keepdim=True)
-            max_sim, _ = torch.max(sim_maps, dim=1, keepdim=True)
-            std_sim = torch.std(sim_maps, dim=1, unbiased=False, keepdim=True)
-            agg = torch.cat([mean_sim, max_sim, std_sim], dim=1)  # [1,3,Hf,Wf]
-
-            if Combined is None:
-                Combined = agg
-            else:
-                # match spatial sizes before concat
-                if Combined.shape[2] != agg.shape[2] or Combined.shape[3] != agg.shape[3]:
-                    agg = F.interpolate(agg, size=(Combined.shape[2], Combined.shape[3]), mode='bilinear', align_corners=False)
-                Combined = torch.cat((Combined, agg), dim=1)  # [1,6,Hf,Wf] after both maps
-
-    return Combined
 
 
 class resizeImage(object):
