@@ -1,12 +1,12 @@
 #-----------------------Utils.py--------------
-import numpy as np
-import torch.nn.functional as F
-import math
-from torchvision import transforms
-import torch
 import cv2
+import math
+import torch
 import matplotlib
+import numpy as np
 import matplotlib.pyplot as plt
+import torch.nn.functional as F
+from torchvision import transforms
 import matplotlib.patches as patches
 matplotlib.use('agg')
 
