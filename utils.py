@@ -22,7 +22,8 @@ IM_NORM_STD = [0.229, 0.224, 0.225]
 def extract_features(feature_model, image, boxes, feat_map_keys=['map3','map4'], exemplar_scales=[0.9,1.1], siamese_models=None):
     """
     Extract image features and compute similarity maps using Siamese models.
-    Returns aggregated features of shape [B, 6, Hf, Wf] suitable for the CountRegressor."""
+    Returns aggregated features of shape [B, 6, Hf, Wf] suitable for the CountRegressor.
+    """
     
     if siamese_models is None:
         raise RuntimeError("You must pass siamese_models={'map3':..., 'map4':...} to extract_features")
