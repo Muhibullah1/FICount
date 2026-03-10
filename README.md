@@ -16,10 +16,10 @@ FICount/
 ├── test.py           # Evaluation script (MAE / RMSE)
 ├── demo.py           # Single-image inference with interactive box selection
 ├── data/             # Dataset directory (see Data Setup)
-│   ├── images_384_VarV2/
-│   ├── gt_density_map_adaptive_384_VarV2/
-│   ├── annotation_FSC147_384.json
-│   └── Train_Test_Val_FSC_147.json
+│    ├── Images/
+│    ├── GTDensity_map/
+│    ├── Annotation.json
+│    └── TrainTestVal.json
 └── logs/             # Checkpoints and training stats (created at runtime)
 ```
 
@@ -35,8 +35,8 @@ python train.py \
   --lambda_ex   1.0 \
   --lambda_adv  0.1 \
   --lambda_id   1.0 \
-  --gpu 0 ```
-
+  --gpu 0 
+```
   # Evaluation
   ```python test.py \
   --data_path  ./data/ \
@@ -45,15 +45,18 @@ python train.py \
   --num_shots  4 \
   --gpu 0```
 To evaluate under the 1-shot setting:
-  ```python test.py --model_path ./logs/FICount_best.pth --num_shots 1 --test_split test```
-
-# Demo
+```
+python test.py --model_path ./logs/FICount_best.pth --num_shots 1 --test_split test
+```
+  # Demo
 Interactive box selection
-```python demo.py \
+```
+python demo.py \
   --input_image /path/to/trap_image.jpg \
   --model_path  ./logs/FICount_best.pth \
   --output_dir  ./output/ \
-  --gpu 0```
+  --gpu 0
+```
 
  # Acknowledgements
 The image transform utilities and training loop structure are adapted from FamNet (CVPR 2021) by Viresh Ranjan, Udbhav Sharma, Thu Nguyen, and Minh Hoai. The PVG design is inspired by the Adversarial Feature Hallucination Network (AFHN, CVPR 2020). The WGAN-GP training objective follows Gulrajani et al. (NeurIPS 2017). 
