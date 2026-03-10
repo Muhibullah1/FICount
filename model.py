@@ -15,28 +15,28 @@ from collections import OrderedDict
 # Backbone
 # ─────────────────────────────────────────────────────────────────────────────
 
+#-------------------Model.py-------------------------
+import torch, torchvision
+import torch.nn as nn
+import torch.nn.functional as F
+from collections import OrderedDict
+
+
 class Resnet50FPN(nn.Module):
-    """Frozen ResNet-50.  Returns map3 (C=1024, stride-16) and map4 (C=2048, stride-32)."""
-
     def __init__(self):
-        super().__init__()
-        resnet = torchvision.models.resnet50(pretrained=True)
-        children = list(resnet.children())
-        self.conv1   = nn.Sequential(*children[:4])   # stride-4
-        self.conv2   = children[4]                     # stride-4
-        self.conv3   = children[5]                     # stride-8
-        self.conv4   = children[6]                     # stride-16  C=1024
-        self.conv5   = children[7]                     # stride-32  C=2048
-        for p in self.parameters():
-            p.requires_grad = False
-
+        super(Resnet50FPN, self).__init__()
+        self.resnet = torchvision.models.resnet50(pretrained=True)
+        children = list(self.resnet.children())
+        self.conv1 = nn.Sequential(*children[:4])
+        self.conv2 = children[4]
+        self.conv3 = children[5]
+        self.conv4 = children[6]
     def forward(self, im_data):
         feat = OrderedDict()
-        x = self.conv1(im_data)
-        x = self.conv2(x)
-        x = self.conv3(x)
-        feat_map3 = self.conv4(x)       # [B, 1024, H/16, W/16]
-        feat_map4 = self.conv5(feat_map3)  # [B, 2048, H/32, W/32]
+        feat_map = self.conv1(im_data)
+        feat_map = self.conv2(feat_map)
+        feat_map3 = self.conv3(feat_map)
+        feat_map4 = self.conv4(feat_map3)
         feat['map3'] = feat_map3
         feat['map4'] = feat_map4
         return feat
