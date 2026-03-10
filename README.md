@@ -7,19 +7,41 @@ FICount is a few-shot insect counting framework designed for dense, heterogeneou
 Requirements: Python 3.8+, PyTorch ≥ 1.12, CUDA 11.x recommended.
 
 # Repository Structure
-
 FICount/
-├── model.py          # Full model: Resnet50FPN, PVG, PVGDiscriminator, LAWC, DensityDecoder\
-├── utils.py          # Transforms, losses (L_ex, WGAN-GP, L_id), visualisation\
-├── train.py          # End-to-end training script\
-├── test.py           # Evaluation script (MAE / RMSE)\
-├── demo.py           # Single-image inference with interactive box selection\
-├── data/             # Dataset directory (see Data Setup)\
-│   ├── images/\
-│   ├── gt_density_map/\
-│   ├── annotation.json\
-│   └── Train_Test_Val.json\
-└── logs/             # Checkpoints and training stats (created at runtime)\
+│
+├── model.py
+│   Full model implementation:
+│   - ResNet50FPN backbone
+│   - Prototype Visual Generator (PVG)
+│   - PVG Discriminator
+│   - Local Adaptive Weighting Component (LAWC)
+│   - Density Decoder
+│
+├── utils.py
+│   Utility functions including:
+│   - Data transforms
+│   - Loss functions (L_ex, WGAN-GP, L_id)
+│   - Visualization tools
+│
+├── train.py
+│   End-to-end training script
+│
+├── test.py
+│   Evaluation script (MAE / RMSE metrics)
+│
+├── demo.py
+│   Single-image inference with interactive exemplar box selection
+│
+├── data/
+│   Dataset directory (see Data Setup section)
+│   ├── images/
+│   ├── gt_density_map/
+│   ├── annotation.json
+│   └── Train_Test_Val.json
+│
+└── logs/
+    Model checkpoints and training statistics
+    (automatically created during training)
 
 # Training
 python train.py \
