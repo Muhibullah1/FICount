@@ -6,7 +6,9 @@ FICount is a few-shot insect counting framework designed for dense, heterogeneou
 # Installation
 Requirements: Python 3.8+, PyTorch ≥ 1.12, CUDA 11.x recommended.
 
-# Repository Structure
+## Repository Structure
+
+```
 FICount/
 │
 ├── model.py
@@ -42,6 +44,7 @@ FICount/
 └── logs/
     Model checkpoints and training statistics
     (automatically created during training)
+```
 
 # Training
 python train.py \
