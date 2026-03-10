@@ -1,424 +1,362 @@
-#-----------------------Utils.py--------------
-import cv2
-import math
-import torch
-import matplotlib
+"""
+utils.py — FICount
+Keeps original image-transform helpers and visualisation utilities.
+Replaces extract_features / MincountLoss / PerturbationLoss with
+FICount-specific losses: exemplar_count_loss, wgan_gp_loss, cosine_identity_loss.
+"""
+
 import numpy as np
-import matplotlib.pyplot as plt
+import torch
 import torch.nn.functional as F
-from torchvision import transforms
+import math
+import cv2
+import matplotlib
+import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from torchvision import transforms
+
 matplotlib.use('agg')
 
 
-MAPS = ['map3','map4']
-Scales = [0.9, 1.1]
-MIN_HW = 384
-MAX_HW = 3840#1584
+# ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+MIN_HW       = 384
+MAX_HW       = 1584
 IM_NORM_MEAN = [0.485, 0.456, 0.406]
-IM_NORM_STD = [0.229, 0.224, 0.225]
+IM_NORM_STD  = [0.229, 0.224, 0.225]
+
+Normalize = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=IM_NORM_MEAN, std=IM_NORM_STD),
+])
 
 
-def extract_features(feature_model, image, boxes, feat_map_keys=['map3','map4'], exemplar_scales=[0.9,1.1], siamese_models=None):
+# ─────────────────────────────────────────────────────────────────────────────
+# Image / box transforms  (unchanged from original)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class resizeImage(object):
+    """Resize so the longest side ≤ MAX_HW and both dims are divisible by 8.
+    Aspect ratio is preserved.  No resize if already within bounds.
+    By: Minh Hoai Nguyen (minhhoai@gmail.com)
     """
-    Extract image features and compute similarity maps using Siamese models.
-    Returns aggregated features of shape [B, 6, Hf, Wf] suitable for the CountRegressor.
+
+    def __init__(self, MAX_HW=1504):
+        self.max_hw = MAX_HW
+
+    def __call__(self, sample):
+        image, lines_boxes = sample['image'], sample['lines_boxes']
+
+        W, H = image.size
+        if W > self.max_hw or H > self.max_hw:
+            scale_factor = float(self.max_hw) / max(H, W)
+            new_H = 8 * int(H * scale_factor / 8)
+            new_W = 8 * int(W * scale_factor / 8)
+            image = transforms.Resize((new_H, new_W))(image)
+        else:
+            scale_factor = 1
+
+        boxes = []
+        for box in lines_boxes:
+            box2 = [int(k * scale_factor) for k in box]
+            y1, x1, y2, x2 = box2[0], box2[1], box2[2], box2[3]
+            boxes.append([y1, x1, y2, x2])
+
+        image = Normalize(image)
+        sample = {'image': image, 'boxes': torch.Tensor(boxes)}
+        return sample
+
+
+class resizeImageWithGT(object):
+    """Same as resizeImage but also resizes the ground-truth density map,
+    preserving the total count sum.
+    By: Minh Hoai Nguyen.  Modified by: Viresh.
     """
-    
-    if siamese_models is None:
-        raise RuntimeError("You must pass siamese_models={'map3':..., 'map4':...} to extract_features")
 
-    device = image.device
-    N, M = image.shape[0], boxes.shape[2]
-    Image_features = feature_model(image)
+    def __init__(self, MAX_HW=1504):
+        self.max_hw = MAX_HW
 
-    Combined = None
+    def __call__(self, sample):
+        image, lines_boxes, density = (
+            sample['image'], sample['lines_boxes'], sample['gt_density']
+        )
 
-    for ix in range(N):
-        boxes_i = boxes[ix][0]
-        for keys in feat_map_keys:
-            image_features = Image_features[keys][ix].unsqueeze(0)
-            Scaling = 8.0 if keys == 'map3' else 16.0
-            boxes_scaled = boxes_i / Scaling
-            boxes_scaled[:, 1:3] = torch.floor(boxes_scaled[:, 1:3])
-            boxes_scaled[:, 3:5] = torch.ceil(boxes_scaled[:, 3:5])
-            boxes_scaled[:, 3:5] += 1
-            feat_h, feat_w = image_features.shape[-2], image_features.shape[-1]
-            boxes_scaled[:, 1:3] = torch.clamp_min(boxes_scaled[:, 1:3], 0)
-            boxes_scaled[:, 3] = torch.clamp_max(boxes_scaled[:, 3], feat_h)
-            boxes_scaled[:, 4] = torch.clamp_max(boxes_scaled[:, 4], feat_w)
+        W, H = image.size
+        if W > self.max_hw or H > self.max_hw:
+            scale_factor = float(self.max_hw) / max(H, W)
+            new_H = 8 * int(H * scale_factor / 8)
+            new_W = 8 * int(W * scale_factor / 8)
+            image           = transforms.Resize((new_H, new_W))(image)
+            orig_count      = np.sum(density)
+            density         = cv2.resize(density, (new_W, new_H))
+            new_count       = np.sum(density)
+            if new_count > 0:
+                density = density * (orig_count / new_count)
+        else:
+            scale_factor = 1
 
-            # Extract exemplar patches
-            exemplar_feats = []
-            for j in range(M):
-                y1, x1 = int(boxes_scaled[j,1]), int(boxes_scaled[j,2])
-                y2, x2 = int(boxes_scaled[j,3]), int(boxes_scaled[j,4])
-                ex = image_features[:,:,y1:y2,x1:x2]
-                exemplar_feats.append(F.interpolate(ex, size=(32,32), mode='bilinear', align_corners=False))
+        boxes = []
+        for box in lines_boxes:
+            box2 = [int(k * scale_factor) for k in box]
+            y1, x1, y2, x2 = box2[0], box2[1], box2[2], box2[3]
+            boxes.append([y1, x1, y2, x2])
 
-            exemplar_feats = torch.cat(exemplar_feats, dim=0).to(device)  # [E, C, 32, 32]
+        image   = Normalize(image)
+        density = torch.from_numpy(density).unsqueeze(0).unsqueeze(0).float()
+        sample  = {'image': image, 'boxes': torch.Tensor(boxes), 'gt_density': density}
+        return sample
 
-            # Siamese similarity map
-            siamese_model = siamese_models[keys]
-            sim_maps = siamese_model(image_features, exemplar_feats)   # [1, E, Hf, Wf]
 
-            # Aggregate across exemplars -> 3 channels per map
-            mean_sim = torch.mean(sim_maps, dim=1, keepdim=True)
-            max_sim, _ = torch.max(sim_maps, dim=1, keepdim=True)
-            std_sim = torch.std(sim_maps, dim=1, unbiased=False, keepdim=True)
-            agg = torch.cat([mean_sim, max_sim, std_sim], dim=1)  # [1,3,Hf,Wf]
+Transform      = transforms.Compose([resizeImage(MAX_HW)])
+TransformTrain = transforms.Compose([resizeImageWithGT(MAX_HW)])
 
-            if Combined is None:
-                Combined = agg
-            else:
-                # match spatial sizes before concat
-                if Combined.shape[2] != agg.shape[2] or Combined.shape[3] != agg.shape[3]:
-                    agg = F.interpolate(agg, size=(Combined.shape[2], Combined.shape[3]), mode='bilinear', align_corners=False)
-                Combined = torch.cat((Combined, agg), dim=1)  # [1,6,Hf,Wf] after both maps
 
-    return Combined
-def select_exemplar_rois(image):
-    all_rois = []
+# ─────────────────────────────────────────────────────────────────────────────
+# Density map construction
+# ─────────────────────────────────────────────────────────────────────────────
 
-    print("Press 'q' or Esc to quit. Press 'n' and then use mouse drag to draw a new examplar, 'space' to save.")
-    while True:
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27 or key == ord('q'):
-            break
-        elif key == ord('n') or key == '\r':
-            rect = cv2.selectROI("image", image, False, False)
-            x1 = rect[0]
-            y1 = rect[1]
-            x2 = x1 + rect[2] - 1
-            y2 = y1 + rect[3] - 1
-
-            all_rois.append([y1, x1, y2, x2])
-            for rect in all_rois:
-                y1, x1, y2, x2 = rect
-                cv2.rectangle(image, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            print("Press q or Esc to quit. Press 'n' and then use mouse drag to draw a new examplar")
-
-    return all_rois
-
-def matlab_style_gauss2D(shape=(3,3),sigma=0.5):
+def matlab_style_gauss2D(shape=(3, 3), sigma=0.5):
+    """2D Gaussian kernel matching MATLAB's fspecial('gaussian', ...).
+    By: Minh Hoai Nguyen.
     """
-    2D gaussian mask - should give the same result as MATLAB's
-    fspecial('gaussian',[shape],[sigma])
-    """
-    m,n = [(ss-1.)/2. for ss in shape]
-    y,x = np.ogrid[-m:m+1,-n:n+1]
-    h = np.exp( -(x*x + y*y) / (2.*sigma*sigma) )
-    h[ h < np.finfo(h.dtype).eps*h.max() ] = 0
+    m, n = [(ss - 1.) / 2. for ss in shape]
+    y, x = np.ogrid[-m:m + 1, -n:n + 1]
+    h    = np.exp(-(x * x + y * y) / (2. * sigma * sigma))
+    h[h < np.finfo(h.dtype).eps * h.max()] = 0
     sumh = h.sum()
     if sumh != 0:
         h /= sumh
     return h
 
-def PerturbationLoss(output,boxes,sigma=8, use_gpu=True):
-    Loss = 0.
-    if boxes.shape[1] > 1:
-        boxes = boxes.squeeze()
-        for tempBoxes in boxes.squeeze():
-            y1 = int(tempBoxes[1])
-            y2 = int(tempBoxes[3])
-            x1 = int(tempBoxes[2])
-            x2 = int(tempBoxes[4])
-            out = output[:,:,y1:y2,x1:x2]
-            GaussKernel = matlab_style_gauss2D(shape=(out.shape[2],out.shape[3]),sigma=sigma)
-            GaussKernel = torch.from_numpy(GaussKernel).float()
-            if use_gpu: GaussKernel = GaussKernel.cuda()
-            Loss += F.mse_loss(out.squeeze(),GaussKernel)
-    else:
-        boxes = boxes.squeeze()
-        y1 = int(boxes[1])
-        y2 = int(boxes[3])
-        x1 = int(boxes[2])
-        x2 = int(boxes[4])
-        out = output[:,:,y1:y2,x1:x2]
-        Gauss = matlab_style_gauss2D(shape=(out.shape[2],out.shape[3]),sigma=sigma)
-        GaussKernel = torch.from_numpy(Gauss).float()
-        if use_gpu: GaussKernel = GaussKernel.cuda()
-        Loss += F.mse_loss(out.squeeze(),GaussKernel) 
-    return Loss
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FICount losses
+# ─────────────────────────────────────────────────────────────────────────────
 
-def MincountLoss(output,boxes, use_gpu=True):
-    ones = torch.ones(1)
-    if use_gpu: ones = ones.cuda()
-    Loss = 0.
-    if boxes.shape[1] > 1:
-        boxes = boxes.squeeze()
-        for tempBoxes in boxes.squeeze():
-            y1 = int(tempBoxes[1])
-            y2 = int(tempBoxes[3])
-            x1 = int(tempBoxes[2])
-            x2 = int(tempBoxes[4])
-            X = output[:,:,y1:y2,x1:x2].sum()
-            if X.item() <= 1:
-                Loss += F.mse_loss(X,ones)
-    else:
-        boxes = boxes.squeeze()
-        y1 = int(boxes[1])
-        y2 = int(boxes[3])
-        x1 = int(boxes[2])
-        x2 = int(boxes[4])
-        X = output[:,:,y1:y2,x1:x2].sum()
-        if X.item() <= 1:
-            Loss += F.mse_loss(X,ones)  
-    return Loss
+def exemplar_count_loss(output, boxes_list):
+    """L_ex: penalise deviation from an integral of 1 inside each exemplar box.
 
+    Each exemplar bounding box should contain exactly one insect (the annotated
+    instance), so the density sum inside the box is encouraged to equal 1.
 
-def pad_to_size(feat, desire_h, desire_w):
-    """ zero-padding a four dim feature matrix: N*C*H*W so that the new Height and Width are the desired ones
-        desire_h and desire_w should be largers than the current height and weight
+    Args:
+        output     : [B, 1, H, W]  predicted density map
+        boxes_list : list of B tensors, each [K, 4]  [y1,x1,y2,x2] in image coords
+
+    Returns:
+        scalar loss (mean over B·K)
     """
+    loss  = 0.0
+    count = 0
+    B, _, H, W = output.shape
 
-    cur_h = feat.shape[-2]
-    cur_w = feat.shape[-1]
+    for b in range(B):
+        boxes = boxes_list[b]   # [K, 4]
+        for k in range(boxes.shape[0]):
+            y1 = max(int(boxes[k, 0]), 0)
+            x1 = max(int(boxes[k, 1]), 0)
+            y2 = min(int(boxes[k, 2]), H)
+            x2 = min(int(boxes[k, 3]), W)
+            if y2 > y1 and x2 > x1:
+                region_sum = output[b, 0, y1:y2, x1:x2].sum()
+                loss  += (region_sum - 1.0) ** 2
+                count += 1
 
-    left_pad = (desire_w - cur_w + 1) // 2
-    right_pad = (desire_w - cur_w) - left_pad
-    top_pad = (desire_h - cur_h + 1) // 2
-    bottom_pad =(desire_h - cur_h) - top_pad
-
-    return F.pad(feat, (left_pad, right_pad, top_pad, bottom_pad))
+    return loss / max(count, 1)
 
 
+def wgan_gp_loss(discriminator, real_feats, fake_feats, lambda_gp=10.0):
+    """WGAN-GP adversarial loss for the PVG discriminator.
 
-class resizeImage(object):
+    Args:
+        discriminator : PVGDiscriminator
+        real_feats    : [N, C, h, w]  real exemplar feature maps
+        fake_feats    : [N, C, h, w]  PVG-generated feature maps
+        lambda_gp     : gradient penalty weight
+
+    Returns:
+        d_loss : discriminator loss  (minimise to train D)
+        g_loss : generator loss      (minimise to train G)
+        gp     : gradient penalty scalar (for logging)
     """
-    If either the width or height of an image exceed a specified value, resize the image so that:
-        1. The maximum of the new height and new width does not exceed a specified value
-        2. The new height and new width are divisible by 8
-        3. The aspect ratio is preserved
-    No resizing is done if both height and width are smaller than the specified value
-    By: Minh Hoai Nguyen (minhhoai@gmail.com)
+    d_real = discriminator(real_feats).mean()
+    d_fake = discriminator(fake_feats.detach()).mean()
+
+    # gradient penalty
+    N     = min(real_feats.shape[0], fake_feats.shape[0])
+    alpha = torch.rand(N, 1, 1, 1, device=real_feats.device)
+    interp = (alpha * real_feats[:N]
+              + (1 - alpha) * fake_feats[:N].detach()).requires_grad_(True)
+    d_interp = discriminator(interp)
+    grads    = torch.autograd.grad(
+        outputs=d_interp, inputs=interp,
+        grad_outputs=torch.ones_like(d_interp),
+        create_graph=True, retain_graph=True,
+    )[0]
+    gp = lambda_gp * ((grads.norm(2, dim=1) - 1) ** 2).mean()
+
+    d_loss = d_fake - d_real + gp          # D maximises real - fake  ↔  minimise fake - real
+    g_loss = -discriminator(fake_feats).mean()   # G maximises D(fake)
+
+    return d_loss, g_loss, gp
+
+
+def cosine_identity_loss(fake_feats, real_feats):
+    """L_id: cosine distance between GAP of each fake and its conditioning real.
+
+    Keeps each PVG variant semantically anchored to the exemplar it was
+    conditioned on, preventing mode collapse toward different insect classes.
+
+    Args:
+        fake_feats : [N, C, h, w]  — N = K × M fakes
+        real_feats : [N, C, h, w]  — matching real exemplars (repeated M times)
+
+    Returns:
+        scalar in [0, 2]
     """
-    
-    def __init__(self, MAX_HW=1504):
-        self.max_hw = MAX_HW
-
-    def __call__(self, sample):
-        image,lines_boxes = sample['image'], sample['lines_boxes']
-        
-        W, H = image.size
-        if W > self.max_hw or H > self.max_hw:
-            scale_factor = float(self.max_hw)/ max(H, W)
-            new_H = 8*int(H*scale_factor/8)
-            new_W = 8*int(W*scale_factor/8)
-            resized_image = transforms.Resize((new_H, new_W))(image)
-        else:
-            scale_factor = 1
-            resized_image = image
-
-        boxes = list()
-        for box in lines_boxes:
-            box2 = [int(k*scale_factor) for k in box]
-            y1, x1, y2, x2 = box2[0], box2[1], box2[2], box2[3]
-            boxes.append([0, y1,x1,y2,x2])
-
-        boxes = torch.Tensor(boxes).unsqueeze(0)
-        resized_image = Normalize(resized_image)
-        sample = {'image':resized_image,'boxes':boxes}
-        return sample
+    fv = F.adaptive_avg_pool2d(fake_feats, 1).view(fake_feats.shape[0], -1)
+    rv = F.adaptive_avg_pool2d(real_feats, 1).view(real_feats.shape[0], -1)
+    return (1.0 - F.cosine_similarity(fv, rv, dim=1)).mean()
 
 
-class resizeImageWithGT(object):
-    """
-    If either the width or height of an image exceed a specified value, resize the image so that:
-        1. The maximum of the new height and new width does not exceed a specified value
-        2. The new height and new width are divisible by 8
-        3. The aspect ratio is preserved
-    No resizing is done if both height and width are smaller than the specified value
-    By: Minh Hoai Nguyen (minhhoai@gmail.com)
-    Modified by: Viresh
-    """
-    
-    def __init__(self, MAX_HW=1504):
-        self.max_hw = MAX_HW
-
-    def __call__(self, sample):
-        image,lines_boxes,density = sample['image'], sample['lines_boxes'],sample['gt_density']
-        
-        W, H = image.size
-        if W > self.max_hw or H > self.max_hw:
-            scale_factor = float(self.max_hw)/ max(H, W)
-            new_H = 8*int(H*scale_factor/8)
-            new_W = 8*int(W*scale_factor/8)
-            resized_image = transforms.Resize((new_H, new_W))(image)
-            resized_density = cv2.resize(density, (new_W, new_H))
-            orig_count = np.sum(density)
-            new_count = np.sum(resized_density)
-
-            if new_count > 0: resized_density = resized_density * (orig_count / new_count)
-            
-        else:
-            scale_factor = 1
-            resized_image = image
-            resized_density = density
-        boxes = list()
-        for box in lines_boxes:
-            box2 = [int(k*scale_factor) for k in box]
-            y1, x1, y2, x2 = box2[0], box2[1], box2[2], box2[3]
-            boxes.append([0, y1,x1,y2,x2])
-
-        boxes = torch.Tensor(boxes).unsqueeze(0)
-        resized_image = Normalize(resized_image)
-        resized_density = torch.from_numpy(resized_density).unsqueeze(0).unsqueeze(0)
-        sample = {'image':resized_image,'boxes':boxes,'gt_density':resized_density}
-        return sample
-
-
-Normalize = transforms.Compose([transforms.ToTensor(),
-    transforms.Normalize(mean=IM_NORM_MEAN, std=IM_NORM_STD)])
-Transform = transforms.Compose([resizeImage( MAX_HW)])
-TransformTrain = transforms.Compose([resizeImageWithGT(MAX_HW)])
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Visualisation  (unchanged from original, adapted box format [y1,x1,y2,x2])
+# ─────────────────────────────────────────────────────────────────────────────
 
 def denormalize(tensor, means=IM_NORM_MEAN, stds=IM_NORM_STD):
-    """Reverses the normalisation on a tensor.
-    Performs a reverse operation on a tensor, so the pixel value range is
-    between 0 and 1. Useful for when plotting a tensor into an image.
-    Normalisation: (image - mean) / std
-    Denormalisation: image * std + mean
-    Args:
-        tensor (torch.Tensor, dtype=torch.float32): Normalized image tensor
-    Shape:
-        Input: :math:`(N, C, H, W)`
-        Output: :math:`(N, C, H, W)` (same shape as input)
-    Return:
-        torch.Tensor (torch.float32): Demornalised image tensor with pixel
-            values between [0, 1]
-    Note:
-        Symbols used to describe dimensions:
-            - N: number of images in a batch
-            - C: number of channels
-            - H: height of the image
-            - W: width of the image
-    """
-
+    """Reverse ImageNet normalisation for display.  Input/output: [C,H,W]."""
     denormalized = tensor.clone()
-
     for channel, mean, std in zip(denormalized, means, stds):
         channel.mul_(std).add_(mean)
-
     return denormalized
 
 
-def scale_and_clip(val, scale_factor, min_val, max_val):
-    "Helper function to scale a value and clip it within range"
+def format_for_plotting(tensor):
+    """Reshape [N,C,H,W] or [C,H,W] → [H,W,C] or [H,W] for imshow."""
+    has_batch = len(tensor.shape) == 4
+    formatted  = tensor.clone()
+    if has_batch:
+        formatted = formatted.squeeze(0)
+    if formatted.shape[0] == 1:
+        return formatted.squeeze(0).detach()
+    return formatted.permute(1, 2, 0).detach()
 
-    new_val = int(round(val*scale_factor))
-    new_val = max(new_val, min_val)
-    new_val = min(new_val, max_val)
-    return new_val
 
+def visualize_output_and_save(input_, output, boxes, save_path,
+                               figsize=(20, 12), dots=None):
+    """Four-panel visualisation: input · overlay · density · density+boxes.
 
-def visualize_output_and_save(input_, output, boxes, save_path, figsize=(20, 12), dots=None):
+    boxes: [K, 4]  [y1, x1, y2, x2] (no batch-index prefix)
+    dots : Nx2 numpy array of GT dot locations, or None
     """
-        dots: Nx2 numpy array for the ground truth locations of the dot annotation
-            if dots is None, this information is not available
-    """
-
-    # get the total count
     pred_cnt = output.sum().item()
-    boxes = boxes.squeeze(0)
+
+    # ensure boxes is 2-D [K, 4]
+    if boxes.dim() == 3:
+        boxes = boxes.squeeze(0)
 
     boxes2 = []
-    for i in range(0, boxes.shape[0]):
-        y1, x1, y2, x2 = int(boxes[i, 1].item()), int(boxes[i, 2].item()), int(boxes[i, 3].item()), int(
-            boxes[i, 4].item())
-        roi_cnt = output[0,0,y1:y2, x1:x2].sum().item()
+    for i in range(boxes.shape[0]):
+        y1 = int(boxes[i, 0].item())
+        x1 = int(boxes[i, 1].item())
+        y2 = int(boxes[i, 2].item())
+        x2 = int(boxes[i, 3].item())
+        roi_cnt = output[0, 0, y1:y2, x1:x2].sum().item()
         boxes2.append([y1, x1, y2, x2, roi_cnt])
 
-    img1 = format_for_plotting(denormalize(input_))
-    output = format_for_plotting(output)
+    img1   = format_for_plotting(denormalize(input_))
+    out_np = format_for_plotting(output)
 
     fig = plt.figure(figsize=figsize)
 
-    # display the input image
+    # ── panel 1: input image with exemplar boxes ──────────────────────────
     ax = fig.add_subplot(2, 2, 1)
     ax.set_axis_off()
     ax.imshow(img1)
-
     for bbox in boxes2:
-        y1, x1, y2, x2 = bbox[0], bbox[1], bbox[2], bbox[3]
-        rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=3, edgecolor='y', facecolor='none')
-        rect2 = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=1, edgecolor='k', linestyle='--', facecolor='none')
+        y1, x1, y2, x2 = bbox[:4]
+        rect  = patches.Rectangle((x1, y1), x2-x1, y2-y1,
+                                   linewidth=3, edgecolor='y', facecolor='none')
+        rect2 = patches.Rectangle((x1, y1), x2-x1, y2-y1,
+                                   linewidth=1, edgecolor='k',
+                                   linestyle='--', facecolor='none')
         ax.add_patch(rect)
         ax.add_patch(rect2)
-
     if dots is not None:
         ax.scatter(dots[:, 0], dots[:, 1], c='red', edgecolors='blue')
-        # ax.scatter(dots[:,0], dots[:,1], c='black', marker='+')
         ax.set_title("Input image, gt count: {}".format(dots.shape[0]))
     else:
         ax.set_title("Input image")
 
+    # ── panel 2: overlay ──────────────────────────────────────────────────
     ax = fig.add_subplot(2, 2, 2)
     ax.set_axis_off()
-    ax.set_title("Overlaid result, predicted count: {:.2f}".format(int(pred_cnt)))
+    ax.set_title("Overlaid result, predicted count: {:.2f}".format(pred_cnt))
+    gray = (0.2989 * img1[:, :, 0]
+            + 0.5870 * img1[:, :, 1]
+            + 0.1140 * img1[:, :, 2])
+    ax.imshow(gray, cmap='gray')
+    ax.imshow(out_np, cmap=plt.cm.viridis, alpha=0.5)
 
-    img2 = 0.2989*img1[:,:,0] + 0.5870*img1[:,:,1] + 0.1140*img1[:,:,2]
-    ax.imshow(img2, cmap='gray')
-    ax.imshow(output, cmap=plt.cm.viridis, alpha=0.5)
-
-
-    # display the density map
+    # ── panel 3: density map ──────────────────────────────────────────────
     ax = fig.add_subplot(2, 2, 3)
     ax.set_axis_off()
-    ax.set_title("Density map, predicted count: {:.2f}".format(int(pred_cnt)))
-    ax.imshow(output)
-    # plt.colorbar()
+    ax.set_title("Density map, predicted count: {:.2f}".format(pred_cnt))
+    ax.imshow(out_np)
 
+    # ── panel 4: density map + exemplar boxes with per-box counts ─────────
     ax = fig.add_subplot(2, 2, 4)
     ax.set_axis_off()
-    ax.set_title("Density map, predicted count: {:.2f}".format(int(pred_cnt)))
-    ret_fig = ax.imshow(output)
+    ax.set_title("Density map with exemplars")
+    ret_fig = ax.imshow(out_np)
     for bbox in boxes2:
-        y1, x1, y2, x2, roi_cnt = bbox[0], bbox[1], bbox[2], bbox[3], bbox[4]
-        rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=3, edgecolor='y', facecolor='none')
-        rect2 = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=1, edgecolor='k', linestyle='--',
-                                  facecolor='none')
+        y1, x1, y2, x2, roi_cnt = bbox
+        rect  = patches.Rectangle((x1, y1), x2-x1, y2-y1,
+                                   linewidth=3, edgecolor='y', facecolor='none')
+        rect2 = patches.Rectangle((x1, y1), x2-x1, y2-y1,
+                                   linewidth=1, edgecolor='k',
+                                   linestyle='--', facecolor='none')
         ax.add_patch(rect)
         ax.add_patch(rect2)
         ax.text(x1, y1, '{:.2f}'.format(roi_cnt), backgroundcolor='y')
-
     fig.colorbar(ret_fig, ax=ax)
 
     fig.savefig(save_path, bbox_inches="tight")
     plt.close()
 
 
-def format_for_plotting(tensor):
-    """Formats the shape of tensor for plotting.
-    Tensors typically have a shape of :math:`(N, C, H, W)` or :math:`(C, H, W)`
-    which is not suitable for plotting as images. This function formats an
-    input tensor :math:`(H, W, C)` for RGB and :math:`(H, W)` for mono-channel
-    data.
-    Args:
-        tensor (torch.Tensor, torch.float32): Image tensor
-    Shape:
-        Input: :math:`(N, C, H, W)` or :math:`(C, H, W)`
-        Output: :math:`(H, W, C)` or :math:`(H, W)`, respectively
-    Return:
-        torch.Tensor (torch.float32): Formatted image tensor (detached)
-    Note:
-        Symbols used to describe dimensions:
-            - N: number of images in a batch
-            - C: number of channels
-            - H: height of the image
-            - W: width of the image
+def select_exemplar_rois(image):
+    """Interactive exemplar selection via OpenCV ROI selector.
+    Press 'n' + drag to draw a box.  Press 'q' or Esc to finish.
+    Returns list of [y1, x1, y2, x2] boxes.
     """
+    all_rois = []
+    print("Press 'q' or Esc to quit. "
+          "Press 'n' then drag to draw an exemplar box.")
+    while True:
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27 or key == ord('q'):
+            break
+        elif key == ord('n') or key == ord('\r'):
+            rect = cv2.selectROI("image", image, False, False)
+            x1   = rect[0]
+            y1   = rect[1]
+            x2   = x1 + rect[2] - 1
+            y2   = y1 + rect[3] - 1
+            all_rois.append([y1, x1, y2, x2])
+            for r in all_rois:
+                ry1, rx1, ry2, rx2 = r
+                cv2.rectangle(image, (rx1, ry1), (rx2, ry2), (255, 0, 0), 2)
+            print("Press 'q' or Esc to quit. "
+                  "Press 'n' then drag to draw another exemplar box.")
+    return all_rois
 
-    has_batch_dimension = len(tensor.shape) == 4
-    formatted = tensor.clone()
 
-    if has_batch_dimension:
-        formatted = tensor.squeeze(0)
-
-    if formatted.shape[0] == 1:
-        return formatted.squeeze(0).detach()
-    else:
-        return formatted.permute(1, 2, 0).detach()
-
+def scale_and_clip(val, scale_factor, min_val, max_val):
+    """Helper to scale a value and clip within range."""
+    new_val = int(round(val * scale_factor))
+    new_val = max(new_val, min_val)
+    new_val = min(new_val, max_val)
+    return new_val
