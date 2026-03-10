@@ -43,7 +43,8 @@ python train.py \
   --model_path ./logs/FICount_best.pth \
   --test_split test \
   --num_shots  4 \
-  --gpu 0```
+  --gpu 0
+```
 To evaluate under the 1-shot setting:
 ```
 python test.py --model_path ./logs/FICount_best.pth --num_shots 1 --test_split test
